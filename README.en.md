@@ -25,6 +25,10 @@ A self-hosted web app for reading books together with your AI. You read and high
 
 - **Mode 1 · Pure Reading**: paginated reader, paragraph-based pages, auto-saved progress, seamless chapter transitions, ☰ table of contents
 - **Mode 2 · Annotated Co-Reading**: select text to highlight or write thoughts; your notes are pink bubbles, AI replies are blue; 💬 view all annotations per chapter
+- **Whole-book notes 📒**: a "笔记 ›" (notes) link on every shelf card (and at the bottom of the reader's 💬 list) gathers all highlights, thoughts, and replies from both sides, grouped by chapter; paginated by actual screen height — swipe or tap the buttons to turn pages; cards collapse to a few lines, tap once to expand, tap again to jump into that chapter
+- **Chapter jump**: a row of "第N章 · count" chips on top of the notes page; tap one to jump to that chapter's first page; the current chapter is highlighted as you page
+- **Unseen AI writing**: highlights the AI made itself (`who: "ai"`) and new AI replies show up as a badge on the shelf's notes link; the notes page offers an "<AI> 有 N 条新的 ›" (N new) chip that jumps to them, and marks those cards with a small "新" (new) tag; opening the notes page marks everything as seen (stored in `books/<book>/seen.json`). AI highlights also render in blue in the reader, and the user can reply to them directly
+- **New-annotation webhook (optional)**: after the user adds highlights or replies and then pauses (8 minutes by default, the timer restarts on every new one), POST a single summary to your webhook — handy for forwarding into a chat app to ping your AI
 - **Upload and go**: txt upload with automatic encoding detection (UTF-8/UTF-16/GBK/Big5) and chapter splitting
 - **Smart chapter splitting**: multiple local regex patterns compete; falls back to DeepSeek heading detection (optional); size-based split as last resort
 - **Plot notes**: after upload, DeepSeek pre-reads each chapter and writes a 150–250 word note (optional) so your AI can restore context without re-reading the original text
@@ -72,6 +76,8 @@ WantedBy=multi-user.target
 | `ai_name` | blue bubble name | `"AI"` |
 | `deepseek_api_key` | DeepSeek key; leave empty to disable chapter fallback & plot notes | `""` |
 | `gardener_log` | JSON log path of an external tidy-up job (leave empty if none) | `""` |
+| `notify_webhook` | webhook URL for new-annotation notifications; leave empty to disable | `""` |
+| `notify_delay_seconds` | seconds of user inactivity before the notification is sent | `480` |
 
 ## Hooking Up Your AI Companion
 
@@ -82,12 +88,24 @@ Annotations live in `books/<book>/annotations/<chapter>.json`:
   "who": "user", "ts": "...", "replies": [{"who": "ai", "text": "AI's reply", "ts": "..."}]}]
 ```
 
-Your AI appends a reply to `replies`; the user refreshes and sees a blue bubble. Two helper endpoints:
+Your AI appends a reply to `replies`; the user refreshes and sees a blue bubble. The AI can also highlight on its own: add an entry with `"who": "ai"` and the user can open it and reply. Please write `ts` as `YYYY-MM-DD HH:MM` (same as the pages do) — the unseen indicator compares timestamps as strings. Helper endpoints:
 
-- `GET /api/pending` — list all annotations awaiting a reply (requires passcode cookie: `rk=<passcode>`)
+- `GET /api/pending` — list all annotations awaiting the AI: user annotations with no reply yet, or whose last reply is from the user (requires passcode cookie: `rk=<passcode>`)
+- `GET /api/allannos/<book>` — all annotations of a book, by chapter, plus `seen` (when the user last opened the notes page)
+- `GET /api/unseen` — per book, how many AI-written items the user hasn't seen yet
 - `GET /api/note/<book>/<chapter>` — read the DeepSeek plot note for fast context recovery
 
 Typical workflow: user highlights → pings the AI in chat → AI reads pending → checks the note / re-reads the chapter → writes back to JSON → user refreshes.
+
+### New-annotation webhook (optional)
+
+Set `notify_webhook` in config.json. Every time the user creates a highlight/thought or replies to an annotation, a timer restarts; once the user has been idle for `notify_delay_seconds`, one summary is POSTed to that URL (`Content-Type: application/json`):
+
+```json
+{"text": "我 在共读小屋留了新的划线/回复：《Book Title》3 条", "books": {"Book Title": 3}}
+```
+
+`text` is a ready-to-forward Chinese sentence; `books` maps book title → number of new items. Point it at your own bot or relay so you no longer have to ping the AI by hand. Leave it empty to send nothing.
 
 ## Security Notes
 

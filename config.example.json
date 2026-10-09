@@ -6,5 +6,7 @@
  "user_name": "我",
  "ai_name": "AI",
  "deepseek_api_key": "",
- "gardener_log": ""
+ "gardener_log": "",
+ "notify_webhook": "",
+ "notify_delay_seconds": 480
 }

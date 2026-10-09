@@ -11,6 +11,7 @@
       meta.json          {title, chapters:[...], created}
       chapters/NNN.txt   单章正文
       annotations/NNN.json  [{id, anchor, note, who, ts, replies:[{who,text,ts}]}]
+      seen.json          {ts}  用户上次打开「笔记」页的时间（用于 AI 新内容提示）
   /root/reading/progress.json  {slug: {ch, page, mode, ts}}
 """
 import json
@@ -40,6 +41,9 @@ LOGIN_HINT = CFG.get("login_hint", "四位数密码")
 USER_NAME = CFG.get("user_name", "我")
 AI_NAME = CFG.get("ai_name", "AI")
 GARDENER_LOG = CFG.get("gardener_log", "")
+# 可选：用户新划线/回复后，攒一会儿再 POST 一条汇总到这个地址（留空不发）
+NOTIFY_WEBHOOK = CFG.get("notify_webhook", "")
+NOTIFY_DELAY = float(CFG.get("notify_delay_seconds", 480))
 
 os.makedirs(BOOKS_DIR, exist_ok=True)
 
@@ -228,6 +232,66 @@ def get_chapter(slug, idx):
         "chapters": meta["chapters"],
         "text": text,
     }
+
+
+# ---------------- 新批注提醒（可选 webhook） ----------------
+# 用户常常一口气划好多条：每来一条就把计时器重置，停手 NOTIFY_DELAY 秒后只发一条汇总。
+_notify = {"n": {}, "timer": None}
+_notify_lock = threading.Lock()
+
+
+def _notify_send():
+    with _notify_lock:
+        counts, _notify["n"], _notify["timer"] = _notify["n"], {}, None
+    if not counts or not NOTIFY_WEBHOOK:
+        return
+    books = {}
+    for slug, n in counts.items():
+        meta = load_json(os.path.join(BOOKS_DIR, slug, "meta.json"), {}) or {}
+        books[meta.get("title", slug)] = n
+    text = "%s 在共读小屋留了新的划线/回复：%s" % (
+        USER_NAME, "、".join("《%s》%d 条" % (t, n) for t, n in books.items()))
+    try:
+        req = urllib.request.Request(
+            NOTIFY_WEBHOOK, data=json.dumps({"text": text, "books": books}, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as e:
+        print("notify webhook failed:", e)
+
+
+def notify_user_activity(slug):
+    if not NOTIFY_WEBHOOK:
+        return
+    with _notify_lock:
+        _notify["n"][slug] = _notify["n"].get(slug, 0) + 1
+        if _notify["timer"]:
+            _notify["timer"].cancel()
+        _notify["timer"] = threading.Timer(NOTIFY_DELAY, _notify_send)
+        _notify["timer"].daemon = True
+        _notify["timer"].start()
+
+
+# ---------------- AI 新内容提示 ----------------
+
+def seen_path(slug):
+    return os.path.join(BOOKS_DIR, slug, "seen.json")
+
+
+def load_seen(slug):
+    return (load_json(seen_path(slug), {}) or {}).get("ts", "")
+
+
+def unseen_count(slug, n_chapters):
+    """AI 写的（AI 自己划的线 + AI 的回复）里，ts 晚于用户上次打开笔记页的条数"""
+    seen = load_seen(slug)
+    n = 0
+    for i in range(n_chapters):
+        for a in load_json(anno_path(slug, i), []):
+            if a.get("who") == "ai" and a.get("ts", "") > seen:
+                n += 1
+            n += sum(1 for r in (a.get("replies") or []) if r.get("who") == "ai" and r.get("ts", "") > seen)
+    return n
 
 
 def anno_path(slug, idx):
@@ -664,6 +728,10 @@ box-shadow:0 1px 6px rgba(120,90,60,.08)}
 .m1{background:var(--mark);color:var(--ink)}
 .m2{background:var(--pink);color:var(--pink-ink);border:1px solid var(--pink-line)}
 .cont{margin-top:10px;font-size:13px;color:var(--accent)}
+.bm{display:flex;align-items:center;gap:8px}
+.nbtn{margin-left:auto;background:none;color:var(--accent);font-size:13px;padding:0 2px}
+.nb{display:inline-block;margin-left:4px;min-width:16px;padding:0 5px;border-radius:8px;
+background:var(--accent);color:#fff;font-size:11px;line-height:16px;text-align:center;vertical-align:middle}
 .up{border:2px dashed var(--pink-line);background:none;text-align:center;padding:26px;
 border-radius:16px;color:var(--sub);width:100%;font-size:15px}
 .empty{text-align:center;color:var(--sub);padding:30px 0}
@@ -683,13 +751,15 @@ async function load(){
  const [books,prog]=await Promise.all([
    fetch('/api/books').then(r=>r.json()),
    fetch('/api/progress').then(r=>r.json())]);
+ let uns={};try{uns=await fetch('/api/unseen').then(r=>r.json());}catch(e){}
  const el=document.getElementById('books');
  if(!books.length){el.innerHTML='<div class="empty">书架还空着，传一本书开始吧</div>';return;}
  el.innerHTML=books.map(b=>{
   const p=prog[b.slug];
   const cont=p?`<div class="cont" onclick="go('${b.slug}',${p.ch},${p.mode})">▸ 继续读：${b.chapters[p.ch]}（${p.mode===2?'批注模式':'阅读模式'}）</div>`:'';
   return `<div class="card"><div class="bt">${b.title}</div>
-  <div class="bm">${b.chapters.length} 章 · ${b.created}</div>
+  <div class="bm"><span>${b.chapters.length} 章 · ${b.created}</span>
+  <button class="nbtn" onclick="location.href='/notes/'+encodeURIComponent('${b.slug}')">笔记 ›${uns[b.slug]?'<span class="nb" title="__ANAME__ 的新内容">'+uns[b.slug]+'</span>':''}</button></div>
   <div class="modes">
    <button class="m1" onclick="go('${b.slug}',${p?p.ch:0},1)">功能一 · 纯阅读</button>
    <button class="m2" onclick="go('${b.slug}',${p?p.ch:0},2)">功能二 · 批注共读</button>
@@ -750,6 +820,7 @@ resize:none;height:70px;outline:none}
 .ok{background:var(--pink);color:var(--pink-ink);border:1px solid var(--pink-line)}
 .cc{background:none;color:var(--sub)}
 .del{background:none;color:var(--sub);font-size:12px;margin-top:4px}
+.allnotes{display:block;text-align:center;color:var(--sub);font-size:13px;padding:16px 0 4px}
 #mask{position:fixed;inset:0;z-index:25;display:none;background:rgba(0,0,0,.2)}
 #mask.on{display:block}
 #alist{position:fixed;top:44px;bottom:52px;right:0;width:82%;max-width:340px;z-index:26;
@@ -866,7 +937,7 @@ function deco(para,annos){
  if(!hits.length)return esc(para);
  const a=hits[0];
  const i=para.indexOf(a.anchor);
- const rep=a.replies&&a.replies.length;
+ const rep=(a.replies&&a.replies.length)||a.who==='ai';
  return esc(para.slice(0,i))+'<mark class="'+(rep?'mr':'mu')+'" data-id="'+a.id+'">'+esc(a.anchor)+
   '<span class="dot '+(rep?'dr':'du')+'"></span></mark>'+deco(para.slice(i+a.anchor.length),annos);
 }
@@ -963,17 +1034,28 @@ function openAnno(id){
  const group=f.L.annos.filter(x=>x.anchor===f.a.anchor);
  const sh=$('sh');
  let h='<div class="quote">'+esc(f.a.anchor)+'</div>';
- let anyReply=false;
+ let anyReply=false,aiAnno=null;
+ /* 按 who 署名：AI 也可以自己划线（who:"ai"），用户可以接着回它 */
+ const who=w=>w==='ai'?'__ANAME__':'__UNAME__',cls=w=>w==='ai'?'br':'bu';
  for(const a of group){
-  if(a.note)h+='<div class="bub bu"><div class="who">__UNAME__</div>'+esc(a.note)+'</div>';
-  else h+='<div class="bub bu"><div class="who">__UNAME__</div>🖊 划了线</div>';
-  for(const r of (a.replies||[])){anyReply=true;
-   h+='<div class="bub br"><div class="who">__ANAME__</div>'+esc(r.text)+'</div>';}
-  h+='<button class="del" onclick="delAnno(\\''+a.id+'\\')">删除这条</button>';
+  h+='<div class="bub '+cls(a.who)+'"><div class="who">'+who(a.who)+'</div>'+(a.note?esc(a.note):'🖊 划了线')+'</div>';
+  if(a.who==='ai'){aiAnno=aiAnno||a;anyReply=true;}
+  for(const r of (a.replies||[])){if(r.who==='ai')anyReply=true;
+   h+='<div class="bub '+cls(r.who)+'"><div class="who">'+who(r.who)+'</div>'+esc(r.text)+'</div>';}
+  if(a.who!=='ai')h+='<button class="del" data-del="'+a.id+'">删除这条</button>';
  }
- if(!anyReply)
+ if(aiAnno)h+='<textarea id="rt" placeholder="回一句…"></textarea><div class="srow"><button class="ok" id="rtok">回复</button></div>';
+ else if(!anyReply)
   h+='<div style="font-size:12px;color:var(--sub)">__ANAME__ 还没看到，聊天里戳他一下～</div>';
  sh.innerHTML=h;sh.classList.add('on');$('mask').classList.add('on');
+ sh.querySelectorAll('[data-del]').forEach(b=>b.onclick=()=>delAnno(b.dataset.del));
+ if(aiAnno)$('rtok').onclick=async()=>{
+  const t=$('rt').value.trim();if(!t)return;
+  $('rtok').disabled=true;
+  await fetch('/api/reply/'+encodeURIComponent(SLUG)+'/'+f.L.ch,{method:'POST',
+   headers:{'Content-Type':'application/json'},body:JSON.stringify({id:aiAnno.id,text:t})});
+  await reloadAnnos(f.L.ch);openAnno(aiAnno.id);
+ };
 }
 async function delAnno(id){
  const f=findAnno(id);if(!f)return;
@@ -994,11 +1076,13 @@ $('abtn').onclick=()=>{
  const el=$('alist');
  const all=[];
  for(const L of loaded)for(const a of L.annos)all.push(a);
- el.innerHTML=all.length?all.map(a=>
+ const more='<a class="allnotes" href="/notes/'+encodeURIComponent(SLUG)+'">整本书的划线和想法 ›</a>';
+ el.innerHTML=(all.length?all.map(a=>
   '<div class="ai" onclick="closeAll();openAnno(\\''+a.id+'\\')">'+
   '<div class="q">'+esc(a.anchor.slice(0,40))+'</div>'+
-  esc(a.note||'🖊 划线')+(a.replies&&a.replies.length?' <span style="color:var(--blue-line)">· __ANAME__回了</span>':'')+
-  '</div>').join(''):'<div style="color:var(--sub);text-align:center;padding:20px">这一章还没有批注</div>';
+  (a.who==='ai'?'<span style="color:var(--blue-line)">__ANAME__：</span>':'')+
+  esc(a.note||'🖊 划线')+((a.replies||[]).some(r=>r.who==='ai')?' <span style="color:var(--blue-line)">· __ANAME__回了</span>':'')+
+  '</div>').join(''):'<div style="color:var(--sub);text-align:center;padding:20px">这一章还没有批注</div>')+more;
  el.classList.add('on');$('mask').classList.add('on');
 };
 function closeAll(){
@@ -1006,6 +1090,121 @@ function closeAll(){
  $('mask').classList.remove('on');$('tool').style.display='none';
 }
 init();
+</script></body></html>"""
+
+
+NOTES_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>笔记</title><style>__CSS__
+/* 整本书的划线和想法：按实际渲染高度分页，左右翻 */
+body{overflow:hidden}
+.top{padding:10px 2px 0;font-size:15px}
+h1{font-size:22px;margin:2px 2px 0;line-height:1.5}
+.cnt{color:var(--sub);font-size:13px;margin:0 2px 4px}
+#chips{display:flex;gap:6px;overflow-x:auto;padding:4px 2px 6px;scrollbar-width:none}
+#chips::-webkit-scrollbar{display:none}
+.chip{flex:0 0 auto;font-size:12px;line-height:1.6;color:var(--sub);border:1px solid var(--line);
+border-radius:12px;padding:2px 10px;background:none;white-space:nowrap}
+.chip.on{color:var(--ink);border-color:var(--ink)}
+.chip.new{color:var(--accent);border-color:var(--accent)}
+#list{position:fixed;left:0;right:0;top:150px;bottom:56px;overflow-y:auto;padding:0 16px;
+max-width:640px;margin:0 auto}
+.chs{font-size:12px;color:var(--sub);margin:12px 2px 4px;letter-spacing:.5px}
+.n{background:var(--card);border:var(--cbd,none);border-radius:var(--radius,14px);
+box-shadow:var(--shadow,0 1px 6px rgba(120,90,60,.08));padding:11px 14px;margin:7px 0;cursor:pointer}
+.n .q{font-size:14px;line-height:1.6;border-left:3px solid var(--pink-line);padding-left:10px;
+color:var(--sub);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.n .q.qa{border-left-color:var(--blue-line)}
+.n .u,.n .a{font-size:14px;margin-top:6px;line-height:1.6;display:-webkit-box;
+-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.n .u{color:var(--pink-ink)}.n .a{color:var(--blue-ink)}
+.n .w{font-size:12px;color:var(--sub);margin-right:6px}
+.n.open .q,.n.open .u,.n.open .a{-webkit-line-clamp:unset;display:block}
+.tagnew{font-size:11px;color:var(--accent);border:1px solid currentColor;border-radius:6px;
+padding:0 4px;margin-left:6px}
+#bot{position:fixed;left:0;right:0;bottom:0;height:52px;display:flex;align-items:center;
+justify-content:space-between;padding:0 18px;background:var(--bgfull,var(--bg));z-index:5}
+#bot button{background:none;font-size:15px;color:var(--accent);padding:6px 14px}
+#bot button:disabled{color:var(--line)}
+#pg{color:var(--sub);font-size:13px}
+.empty{text-align:center;color:var(--sub);padding:40px 0}
+</style></head><body><div class="wrap" id="head">
+<div class="top"><a href="/">〈 书架</a></div>
+<h1 id="bt"></h1><div class="cnt" id="cnt"></div>
+<div id="chips"></div>
+</div>
+<div id="list"></div>
+<div id="bot"><button id="pv">‹ 上一页</button><span id="pg"></span><button id="nx">下一页 ›</button></div>
+<script>
+const SLUG=__SLUG__;
+let items=[],pages=[],cur=0,SEEN='';
+const $=id=>document.getElementById(id);
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+/* AI 写的、且晚于上次打开笔记页的，算「新的」 */
+function hasNew(a){return (a.who==='ai'&&(a.ts||'')>SEEN)||(a.replies||[]).some(r=>r.who==='ai'&&(r.ts||'')>SEEN);}
+function line(w,t){return '<div class="'+(w==='ai'?'a':'u')+'"><span class="w">'+(w==='ai'?'__ANAME__':'__UNAME__')+'</span>'+esc(t)+'</div>';}
+function card(it){
+ const a=it.a;
+ return '<div class="n" data-ch="'+it.ch+'"><div class="q'+(a.who==='ai'?' qa':'')+'">'+esc(a.anchor)+
+  (hasNew(a)?'<span class="tagnew">新</span>':'')+'</div>'+
+  (a.note?line(a.who,a.note):'')+(a.replies||[]).map(r=>line(r.who,r.text)).join('')+'</div>';
+}
+/* 按实际高度分页：一页塞到放不下为止，卡片长短不一也不会被截断 */
+function paginate(){
+ const box=$('list'),H=box.clientHeight;
+ pages=[];let pg=[],lastCh=-1;
+ for(const it of items){
+  const head=it.ch!==lastCh?'<div class="chs">'+esc(it.title)+'</div>':'';
+  box.innerHTML=pg.map(x=>x.html).join('')+head+card(it);
+  if(box.scrollHeight>H&&pg.length){
+   pages.push(pg);pg=[{it:it,html:'<div class="chs">'+esc(it.title)+'</div>'+card(it)}];
+  }else pg.push({it:it,html:head+card(it)});
+  lastCh=it.ch;
+ }
+ if(pg.length)pages.push(pg);
+}
+function show(focusCh){
+ const box=$('list');
+ box.innerHTML=pages.length?pages[cur].map(x=>x.html).join(''):'<div class="empty">这本书还没有划线和想法</div>';
+ box.scrollTop=0;
+ $('pg').textContent=pages.length?(cur+1)+' / '+pages.length:'';
+ $('pv').disabled=cur<=0;$('nx').disabled=cur>=pages.length-1;
+ /* 当前章：点章节跳过来的就是那一章，翻页时取本页第一条所在的章 */
+ const chNow=focusCh!=null?focusCh:(pages.length?pages[cur][0].it.ch:-1);
+ document.querySelectorAll('#chips .chip[data-ch]').forEach(c=>{
+  const on=+c.dataset.ch===chNow;c.classList.toggle('on',on);
+  if(on)c.scrollIntoView({inline:'nearest',block:'nearest'});});
+ /* 第一次点展开全文，再点跳进那一章 */
+ box.querySelectorAll('.n').forEach(n=>n.onclick=()=>{
+  if(!n.classList.contains('open')){n.classList.add('open');return;}
+  location.href='/read/'+encodeURIComponent(SLUG)+'/'+n.dataset.ch+'?mode=2';});
+}
+function go(d){const c=cur+d;if(c>=0&&c<pages.length){cur=c;show();}}
+function jumpTo(test){const i=pages.findIndex(pg=>pg.some(x=>test(x.it)));
+ if(i>=0){cur=i;show(pages[i].find(x=>test(x.it)).it.ch);}}
+$('pv').onclick=()=>go(-1);$('nx').onclick=()=>go(1);
+let sx=0,sy=0;
+document.addEventListener('touchstart',e=>{sx=e.touches[0].clientX;sy=e.touches[0].clientY;},{passive:true});
+document.addEventListener('touchend',e=>{
+ const dx=e.changedTouches[0].clientX-sx,dy=e.changedTouches[0].clientY-sy;
+ if(e.target.closest&&e.target.closest('#chips'))return;
+ if(Math.abs(dx)>50&&Math.abs(dx)>Math.abs(dy))go(dx<0?1:-1);});
+fetch('/api/allannos/'+encodeURIComponent(SLUG)).then(r=>r.json()).then(d=>{
+ $('bt').textContent=d.title||'';
+ SEEN=d.seen||'';
+ for(const c of d.chapters)for(const a of c.annos)items.push({ch:c.ch,title:c.title,a:a});
+ const nNew=items.filter(it=>hasNew(it.a)).length;
+ $('chips').innerHTML=(nNew?'<button class="chip new" id="cnew">__ANAME__ 有 '+nNew+' 条新的 ›</button>':'')+
+  d.chapters.map(c=>'<button class="chip" data-ch="'+c.ch+'" title="'+esc(c.title)+'">第'+(c.ch+1)+'章 · '+c.annos.length+'</button>').join('');
+ if(!d.chapters.length)$('chips').style.display='none';
+ document.querySelectorAll('#chips .chip[data-ch]').forEach(b=>b.onclick=()=>jumpTo(it=>it.ch===+b.dataset.ch));
+ if($('cnew'))$('cnew').onclick=()=>jumpTo(it=>hasNew(it.a));
+ $('cnt').textContent=items.length?('共 '+items.length+' 处 · 左右滑动翻页，点卡片展开，再点进入原文'):'';
+ $('list').style.top=($('head').getBoundingClientRect().bottom+2)+'px';
+ paginate();show();
+ /* 打开过笔记页就算看过了 */
+ fetch('/api/seen/'+encodeURIComponent(SLUG),{method:'POST'}).catch(()=>{});
+});
 </script></body></html>"""
 
 
@@ -1227,8 +1426,33 @@ class Handler(BaseHTTPRequestHandler):
                 SLUG=json.dumps(slug, ensure_ascii=False),
                 CH=str(idx), MODE=str(mode)))
 
+        m = re.match(r"^/notes/([^/]+)$", path)
+        if m:
+            if not load_json(os.path.join(BOOKS_DIR, m.group(1), "meta.json"), None):
+                return self.send_html("<h3>没找到这本书</h3>", 404)
+            return self.send_html(render(NOTES_HTML, SLUG=json.dumps(m.group(1), ensure_ascii=False)))
+
+        # 整本书的划线/想法/回复（笔记页用），附带 seen 时间
+        m = re.match(r"^/api/allannos/([^/]+)$", path)
+        if m:
+            slug = m.group(1)
+            meta = load_json(os.path.join(BOOKS_DIR, slug, "meta.json"), None)
+            if not meta:
+                return self.send_json({"error": "not found"}, 404)
+            chs = []
+            for i, t in enumerate(meta["chapters"]):
+                annos = load_json(anno_path(slug, i), [])
+                if annos:
+                    chs.append({"ch": i, "title": t, "annos": annos})
+            return self.send_json({"title": meta["title"], "chapters": chs, "seen": load_seen(slug)})
+
         if path == "/api/books":
             return self.send_json(list_books())
+
+        # {slug: AI 新写的条数}，书架「笔记」角标用
+        if path == "/api/unseen":
+            return self.send_json({b["slug"]: unseen_count(b["slug"], len(b["chapters"]))
+                                   for b in list_books()})
 
         if path == "/api/progress":
             return self.send_json(load_json(PROGRESS_FILE, {}))
@@ -1274,6 +1498,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         # Rhys 专用：列出所有还没回应的批注
+        # （用户的批注还没有回复；或者最后一条回复是用户写的，比如用户回了 AI 自己划的线）
         if path == "/api/pending":
             out = []
             for b in list_books():
@@ -1281,8 +1506,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not os.path.isdir(adir):
                     continue
                 for fn in sorted(os.listdir(adir)):
+                    if not re.match(r"^\d{3}\.json$", fn):
+                        continue
                     for a in load_json(os.path.join(adir, fn), []):
-                        if not a.get("replies"):
+                        rs = a.get("replies") or []
+                        if (a.get("who") != "ai" and not rs) or (rs and rs[-1].get("who") != "ai"):
                             out.append({"book": b["slug"], "chapter": int(fn[:3]), **a})
             return self.send_json(out)
 
@@ -1292,6 +1520,31 @@ class Handler(BaseHTTPRequestHandler):
         path = unquote(urlparse(self.path).path)
         if not self.authed():
             return self.send_json({"error": "unauthorized"}, 401)
+
+        # 打开笔记页 = 看过了
+        m = re.match(r"^/api/seen/([^/]+)$", path)
+        if m:
+            slug = m.group(1)
+            if not load_json(os.path.join(BOOKS_DIR, slug, "meta.json"), None):
+                return self.send_json({"error": "not found"}, 404)
+            save_json(seen_path(slug), {"ts": time.strftime("%Y-%m-%d %H:%M")})
+            return self.send_json({"ok": True})
+
+        # 用户回复某条批注（比如 AI 自己划的线）
+        m = re.match(r"^/api/reply/([^/]+)/(\d+)$", path)
+        if m:
+            slug, idx = m.group(1), int(m.group(2))
+            d = json.loads(self.body() or b"{}")
+            text = str(d.get("text", "")).strip()[:2000]
+            annos = load_json(anno_path(slug, idx), [])
+            for a in annos:
+                if text and a.get("id") == d.get("id"):
+                    a.setdefault("replies", []).append(
+                        {"who": "user", "text": text, "ts": time.strftime("%Y-%m-%d %H:%M")})
+                    save_json(anno_path(slug, idx), annos)
+                    notify_user_activity(slug)
+                    return self.send_json({"ok": True})
+            return self.send_json({"ok": False, "error": "not found"}, 404)
 
         if path == "/api/upload":
             raw = self.body()
@@ -1338,6 +1591,7 @@ class Handler(BaseHTTPRequestHandler):
                 "replies": [],
             })
             save_json(anno_path(slug, idx), annos)
+            notify_user_activity(slug)
             return self.send_json({"ok": True})
 
         self.send_json({"error": "not found"}, 404)
