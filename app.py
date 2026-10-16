@@ -14,6 +14,7 @@
       seen.json          {ts}  用户上次打开「笔记」页的时间（用于 AI 新内容提示）
   /root/reading/progress.json  {slug: {ch, page, mode, ts}}
 """
+import base64
 import json
 import os
 import re
@@ -297,6 +298,65 @@ def unseen_count(slug, n_chapters):
 def anno_path(slug, idx):
     return os.path.join(BOOKS_DIR, slug, "annotations", f"{idx:03d}.json")
 
+
+# ── 批注上锁 ──
+# 带 "lock": true 的批注：先写的那一方的内容锁着，另一方也写了一条（回复），两边才互相看到。
+# 她先写：她的想法存成 "sealed"（不直接写在 note 里），他那边读文件看到的是「🔒」；他写了回复以后，
+#         服务器把原文放回 note、记下 unlocked 时间。
+# 他先写（他自己划线 who:"ai" 再加 "lock": true）：网页上只露出「有一条锁着的想法」，她回了一条才看得到。
+# 注意：这是「规矩锁」不是密码锁——他在服务器上直接翻文件也能硬解 sealed（只是 base64），靠的是约定：
+#       先写自己的，再看对方的。他要回复，最好走 POST /api/ai_reply，写完马上拿到解开的原文。
+LOCK_HINT_USER = "🔒 锁着的想法：你也写一条，就能解开"
+LOCK_HINT_AI = "🔒 她锁上了：你先写下你自己的想法，才能看到她写了什么"
+
+def _seal(t):
+    return base64.b64encode(t.encode("utf-8")).decode("ascii")
+
+def _unseal(t):
+    try:
+        return base64.b64decode(t.encode("ascii")).decode("utf-8")
+    except Exception:
+        return ""
+
+def lock_wait(a):
+    """锁着的话返回还在等谁写（"user" / "ai"），已经解开或没上锁返回 None。"""
+    if not a.get("lock"):
+        return None
+    starter = a.get("who", "user")
+    other = "ai" if starter == "user" else "user"
+    if any(r.get("who") == other for r in (a.get("replies") or [])):
+        return None
+    return other
+
+def open_ready(slug, idx, annos):
+    """两边都写过的锁：把封着的原文放回去、记解锁时间，写回文件。"""
+    changed = False
+    for a in annos:
+        if a.get("lock") and lock_wait(a) is None and not a.get("unlocked"):
+            if "sealed" in a:
+                a["note"] = _unseal(a.pop("sealed"))
+            a["unlocked"] = time.strftime("%Y-%m-%d %H:%M")
+            changed = True
+    if changed:
+        save_json(anno_path(slug, idx), annos)
+    return annos
+
+def for_user(annos):
+    """给她看的那一份：她自己锁着的照常看得到；他先写、她还没回的，只露出「有一条锁着」。"""
+    out = []
+    for a in annos:
+        b = dict(a)
+        w = lock_wait(a)
+        if "sealed" in b:
+            b["note"] = _unseal(b.pop("sealed"))
+        if w == "user":
+            b["note"] = LOCK_HINT_USER
+            b["replies"] = []
+            b["locked"] = "user"
+        elif w == "ai":
+            b["locked"] = "ai"
+        out.append(b)
+    return out
 
 def note_path(slug, idx):
     return os.path.join(BOOKS_DIR, slug, "notes", f"{idx:03d}.md")
@@ -820,6 +880,9 @@ resize:none;height:70px;outline:none}
 .ok{background:var(--pink);color:var(--pink-ink);border:1px solid var(--pink-line)}
 .cc{background:none;color:var(--sub)}
 .del{background:none;color:var(--sub);font-size:12px;margin-top:4px}
+.lk{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--sub);margin-top:8px}
+.lkw{font-size:12px;color:var(--sub);margin:-2px 0 8px}
+.bub.lkd{opacity:.75;font-style:italic}
 .allnotes{display:block;text-align:center;color:var(--sub);font-size:13px;padding:16px 0 4px}
 #mask{position:fixed;inset:0;z-index:25;display:none;background:rgba(0,0,0,.2)}
 #mask.on{display:block}
@@ -1007,8 +1070,9 @@ function openEditor(anchor){
  const sh=$('sh');
  sh.innerHTML='<div class="quote">'+esc(anchor)+'</div>'+
   '<textarea id="nt" placeholder="想说什么…"></textarea>'+
+  '<label class="lk"><input type="checkbox" id="lk"> 🔒 锁上：__ANAME__ 也写了想法，你们才互相看到</label>'+
   '<div class="srow"><button class="cc" onclick="closeAll()">算了</button>'+
-  '<button class="ok" onclick="saveAnno(pendCache,document.getElementById(\\'nt\\').value)">存下来 ♡</button></div>';
+  '<button class="ok" onclick="saveAnno(pendCache,document.getElementById(\\'nt\\').value,document.getElementById(\\'lk\\').checked)">存下来 ♡</button></div>';
  window.pendCache=anchor;
  sh.classList.add('on');$('mask').classList.add('on');
  setTimeout(()=>$('nt').focus(),100);
@@ -1017,11 +1081,11 @@ async function reloadAnnos(ch){
  const L=loaded.find(x=>x.ch===ch);
  if(L)L.annos=await fetch('/api/annotations/'+encodeURIComponent(SLUG)+'/'+ch).then(r=>r.json());
 }
-async function saveAnno(anchor,note){
+async function saveAnno(anchor,note,lock){
  const ch=pendCh;
  await fetch('/api/annotations/'+encodeURIComponent(SLUG)+'/'+ch,{method:'POST',
   headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({anchor:anchor,note:note,who:'user'})});
+  body:JSON.stringify({anchor:anchor,note:note,who:'user',lock:!!lock})});
  await reloadAnnos(ch);
  closeAll();FLOW?renderScroll():render();
 }
@@ -1038,11 +1102,13 @@ function openAnno(id){
  /* 按 who 署名：AI 也可以自己划线（who:"ai"），用户可以接着回它 */
  const who=w=>w==='ai'?'__ANAME__':'__UNAME__',cls=w=>w==='ai'?'br':'bu';
  for(const a of group){
-  h+='<div class="bub '+cls(a.who)+'"><div class="who">'+who(a.who)+'</div>'+(a.note?esc(a.note):'🖊 划了线')+'</div>';
+  h+='<div class="bub '+cls(a.who)+(a.locked==='user'?' lkd':'')+'"><div class="who">'+who(a.who)+(a.lock?' 🔒':'')+'</div>'+(a.note?esc(a.note):'🖊 划了线')+'</div>';
+  if(a.locked==='ai')h+='<div class="lkw">🔒 锁着：等 __ANAME__ 也写下他的想法，你们就能互相看到</div>';
   if(a.who==='ai'){aiAnno=aiAnno||a;anyReply=true;}
   for(const r of (a.replies||[])){if(r.who==='ai')anyReply=true;
    h+='<div class="bub '+cls(r.who)+'"><div class="who">'+who(r.who)+'</div>'+esc(r.text)+'</div>';}
   if(a.who!=='ai')h+='<button class="del" data-del="'+a.id+'">删除这条</button>';
+  if(a.locked==='ai')anyReply=true;
  }
  if(aiAnno)h+='<textarea id="rt" placeholder="回一句…"></textarea><div class="srow"><button class="ok" id="rtok">回复</button></div>';
  else if(!anyReply)
@@ -1441,7 +1507,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"error": "not found"}, 404)
             chs = []
             for i, t in enumerate(meta["chapters"]):
-                annos = load_json(anno_path(slug, i), [])
+                annos = for_user(open_ready(slug, i, load_json(anno_path(slug, i), [])))
                 if annos:
                     chs.append({"ch": i, "title": t, "annos": annos})
             return self.send_json({"title": meta["title"], "chapters": chs, "seen": load_seen(slug)})
@@ -1464,7 +1530,8 @@ class Handler(BaseHTTPRequestHandler):
 
         m = re.match(r"^/api/annotations/([^/]+)/(\d+)$", path)
         if m:
-            return self.send_json(load_json(anno_path(m.group(1), int(m.group(2))), []))
+            slug, idx = m.group(1), int(m.group(2))
+            return self.send_json(for_user(open_ready(slug, idx, load_json(anno_path(slug, idx), []))))
 
         # 章节剧情笔记（DeepSeek预读生成，供AI伴读快速恢复上下文）
         m = re.match(r"^/api/note/([^/]+)/(\d+)$", path)
@@ -1511,7 +1578,12 @@ class Handler(BaseHTTPRequestHandler):
                     for a in load_json(os.path.join(adir, fn), []):
                         rs = a.get("replies") or []
                         if (a.get("who") != "ai" and not rs) or (rs and rs[-1].get("who") != "ai"):
-                            out.append({"book": b["slug"], "chapter": int(fn[:3]), **a})
+                            item = {"book": b["slug"], "chapter": int(fn[:3]), **a}
+                            if lock_wait(a) == "ai":
+                                item.pop("sealed", None)
+                                item["note"] = LOCK_HINT_AI
+                                item["locked"] = "ai"
+                            out.append(item)
             return self.send_json(out)
 
         self.send_json({"error": "not found"}, 404)
@@ -1542,8 +1614,25 @@ class Handler(BaseHTTPRequestHandler):
                     a.setdefault("replies", []).append(
                         {"who": "user", "text": text, "ts": time.strftime("%Y-%m-%d %H:%M")})
                     save_json(anno_path(slug, idx), annos)
+                    open_ready(slug, idx, annos)
                     notify_user_activity(slug)
                     return self.send_json({"ok": True})
+            return self.send_json({"ok": False, "error": "not found"}, 404)
+
+        # 他回复某条批注（走这里，写完马上拿到解开的原文；他直接改 JSON 也行，下次有人打开网页时会自动解开）
+        m = re.match(r"^/api/ai_reply/([^/]+)/(\d+)$", path)
+        if m:
+            slug, idx = m.group(1), int(m.group(2))
+            d = json.loads(self.body() or b"{}")
+            text = str(d.get("text", "")).strip()[:2000]
+            annos = load_json(anno_path(slug, idx), [])
+            for a in annos:
+                if text and a.get("id") == d.get("id"):
+                    a.setdefault("replies", []).append(
+                        {"who": "ai", "text": text, "ts": time.strftime("%Y-%m-%d %H:%M")})
+                    save_json(anno_path(slug, idx), annos)
+                    open_ready(slug, idx, annos)
+                    return self.send_json({"ok": True, "annotation": a})
             return self.send_json({"ok": False, "error": "not found"}, 404)
 
         if path == "/api/upload":
@@ -1582,14 +1671,20 @@ class Handler(BaseHTTPRequestHandler):
             slug, idx = m.group(1), int(m.group(2))
             d = json.loads(self.body() or b"{}")
             annos = load_json(anno_path(slug, idx), [])
-            annos.append({
+            note = d.get("note", "")[:2000]
+            item = {
                 "id": uuid.uuid4().hex[:8],
                 "anchor": d.get("anchor", "")[:300],
-                "note": d.get("note", "")[:2000],
+                "note": note,
                 "who": "user",
                 "ts": time.strftime("%Y-%m-%d %H:%M"),
                 "replies": [],
-            })
+            }
+            if d.get("lock") and note.strip():
+                item["lock"] = True
+                item["note"] = "🔒"
+                item["sealed"] = _seal(note)
+            annos.append(item)
             save_json(anno_path(slug, idx), annos)
             notify_user_activity(slug)
             return self.send_json({"ok": True})
